@@ -46,7 +46,10 @@ TP_PCT = 0.30          # 30% take profit on YES
 
 def find_tomorrow_event(series_ticker: str) -> dict | None:
     """Find the event for tomorrow's weather date."""
-    tomorrow = date.today() + timedelta(days=1)
+    # Use Pacific time since we run at ~11pm PT
+    utc_now = datetime.utcnow()
+    pt_now = utc_now - timedelta(hours=8)  # PT = UTC-8 (PST) or UTC-7 (PDT)
+    tomorrow = pt_now.date() + timedelta(days=1)
 
     # Try to find event by constructing the ticker
     # Format: KXHIGHTPHX-26MAR31
@@ -218,7 +221,9 @@ def compute_bets(markets: list[dict], bankroll: float, url_base: str) -> list[di
 
 def format_discord_message(all_bets: dict, bankroll: float) -> str:
     """Format the Discord alert message."""
-    tomorrow = date.today() + timedelta(days=1)
+    utc_now = datetime.utcnow()
+    pt_now = utc_now - timedelta(hours=8)
+    tomorrow = pt_now.date() + timedelta(days=1)
     day_name = tomorrow.strftime("%A, %B %d")
 
     lines = [
