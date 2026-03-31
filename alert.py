@@ -48,7 +48,7 @@ def find_tomorrow_event(series_ticker: str) -> dict | None:
     """Find the event for tomorrow's weather date."""
     # Use Pacific time since we run at ~11pm PT
     utc_now = datetime.utcnow()
-    pt_now = utc_now - timedelta(hours=8)  # PT = UTC-8 (PST) or UTC-7 (PDT)
+    pt_now = utc_now - timedelta(hours=7)  # PDT = UTC-7 (March-November)
     tomorrow = pt_now.date() + timedelta(days=1)
 
     # Try to find event by constructing the ticker
