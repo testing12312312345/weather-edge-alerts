@@ -141,7 +141,7 @@ def parse_bucket_label(title: str) -> str:
     return title
 
 
-def compute_bets(markets: list[dict], bankroll: float, url_base: str) -> list[dict]:
+def compute_bets(markets: list[dict], bankroll: float, url_base: str, event_ticker: str = "") -> list[dict]:
     """Compute the straddle bets for a city."""
     # Get prices for all buckets
     buckets = []
@@ -158,7 +158,7 @@ def compute_bets(markets: list[dict], bankroll: float, url_base: str) -> list[di
             "mid": prices["mid"],
             "yes_bid": prices["yes_bid"],
             "yes_ask": prices["yes_ask"],
-            "url": f"{url_base}/{ticker.lower()}",
+            "url": f"{url_base}/{event_ticker.lower()}",
         })
 
     if len(buckets) < 4:
@@ -357,7 +357,7 @@ def main():
             all_bets[city_key] = {"name": name, "bets": []}
             continue
 
-        bets = compute_bets(markets, BANKROLL, city_info["url_base"])
+        bets = compute_bets(markets, BANKROLL, city_info["url_base"], event_ticker)
         print(f"  Bets: {len(bets)}")
         for bet in bets:
             print(f"    {bet['type']} {bet['label']}: {bet['contracts']} contracts @ ${bet.get('entry_price', bet.get('no_cost', 0)):.2f}")
