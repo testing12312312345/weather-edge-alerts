@@ -19,9 +19,21 @@ BANKROLL = float(os.environ.get("BANKROLL", "30"))
 KALSHI_API = "https://api.elections.kalshi.com/trade-api/v2"
 
 CITIES = {
-    "PHX": {"series": "KXHIGHTPHX", "name": "Phoenix", "slug": "phoenix-high-temperature-daily"},
-    "LAX": {"series": "KXHIGHLAX", "name": "Los Angeles", "slug": "highest-temperature-in-los-angeles"},
-    "LV": {"series": "KXHIGHTLV", "name": "Las Vegas", "slug": "las-vegas-high-temperature-daily"},
+    "PHX": {
+        "series": "KXHIGHTPHX",
+        "name": "Phoenix",
+        "url_base": "https://kalshi.com/markets/kxhightphx/phoenix-high-temperature-daily",
+    },
+    "LAX": {
+        "series": "KXHIGHLAX",
+        "name": "Los Angeles",
+        "url_base": "https://kalshi.com/markets/kxhighlax/highest-temperature-in-los-angeles",
+    },
+    "LV": {
+        "series": "KXHIGHTLV",
+        "name": "Las Vegas",
+        "url_base": "https://kalshi.com/markets/kxhightlv/las-vegas-high-temperature-daily",
+    },
 }
 
 TAIL_ALLOC = 0.05      # 5% per tail NO
@@ -126,7 +138,7 @@ def parse_bucket_label(title: str) -> str:
     return title
 
 
-def compute_bets(markets: list[dict], bankroll: float, city_slug: str, series: str) -> list[dict]:
+def compute_bets(markets: list[dict], bankroll: float, url_base: str) -> list[dict]:
     """Compute the straddle bets for a city."""
     # Get prices for all buckets
     buckets = []
@@ -143,7 +155,7 @@ def compute_bets(markets: list[dict], bankroll: float, city_slug: str, series: s
             "mid": prices["mid"],
             "yes_bid": prices["yes_bid"],
             "yes_ask": prices["yes_ask"],
-            "url": f"https://kalshi.com/markets/{city_slug}/{ticker.lower()}",
+            "url": f"{url_base}/{ticker.lower()}",
         })
 
     if len(buckets) < 4:
@@ -321,7 +333,6 @@ def main():
     for city_key, city_info in CITIES.items():
         series = city_info["series"]
         name = city_info["name"]
-        slug = city_info["slug"]
 
         print(f"Processing {name}...")
 
@@ -341,7 +352,7 @@ def main():
             all_bets[city_key] = {"name": name, "bets": []}
             continue
 
-        bets = compute_bets(markets, BANKROLL, slug, series)
+        bets = compute_bets(markets, BANKROLL, city_info["url_base"])
         print(f"  Bets: {len(bets)}")
         for bet in bets:
             print(f"    {bet['type']} {bet['label']}: {bet['contracts']} contracts @ ${bet.get('entry_price', bet.get('no_cost', 0)):.2f}")
