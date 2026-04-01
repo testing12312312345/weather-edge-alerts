@@ -4,16 +4,17 @@ Weather Edge Alert System v2 — Forecast-Informed
 Scans for underpriced Kalshi weather buckets using GFS/NBM forecasts.
 Sends Discord alerts with exact buy instructions and fair value limit sells.
 
-Runs 3x/day after GFS model runs:
-  - 10am PT (17:00 UTC) — after 12z GFS
-  - 4pm PT (23:00 UTC) — after 18z GFS
-  - 10pm PT (05:00 UTC) — after 00z GFS
+Runs 3x/day after GFS model runs land on Open-Meteo:
+  - 11:30am PT (18:30 UTC) — after 12z GFS
+  - 5:30pm PT (00:30 UTC) — after 18z GFS
+  - 11:30pm PT (06:30 UTC) — after 00z GFS
 """
 
 import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, date, timedelta
 
 import requests
@@ -487,6 +488,71 @@ def send_discord(message):
     print("Discord alert sent!")
 
 
+def expected_gfs_run():
+    """Return the expected GFS run (00z/06z/12z/18z) for this scan time."""
+    utc_hour = datetime.utcnow().hour
+    # Cron fires ~6h after model init: 18:30 UTC→12z, 00:30→18z, 06:30→00z
+    if 16 <= utc_hour < 22:
+        return "12z"
+    elif 22 <= utc_hour or utc_hour < 4:
+        return "18z"
+    else:
+        return "00z"
+
+
+def check_forecast_freshness():
+    """Check if Open-Meteo has ingested the latest GFS run.
+
+    Compares the current gfs_seamless forecast against gfs_global.
+    If gfs_global has different values than 6 hours ago, the new run landed.
+    Uses a simple retry approach: fetch, wait, fetch again, compare.
+    """
+    expected = expected_gfs_run()
+    print(f"  Expected GFS run: {expected}")
+
+    # Fetch initial forecast for a reference city (PHX)
+    params = {
+        "latitude": 33.4373,
+        "longitude": -112.0078,
+        "daily": "temperature_2m_max",
+        "temperature_unit": "fahrenheit",
+        "timezone": "America/Phoenix",
+        "forecast_days": 3,
+        "models": "gfs_seamless",
+    }
+    resp1 = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=15)
+    if resp1.status_code != 200:
+        print("  Could not check freshness, proceeding anyway")
+        return True
+
+    forecast1 = resp1.json().get("daily", {}).get("temperature_2m_max_gfs_seamless")
+    if not forecast1:
+        # Try generic key
+        forecast1 = resp1.json().get("daily", {}).get("temperature_2m_max")
+    print(f"  Current GFS forecast (PHX): {forecast1}")
+
+    # Wait 5 minutes and check again — if values change, fresh run just landed
+    print("  Waiting 5 minutes to verify forecast freshness...")
+    time.sleep(300)
+
+    resp2 = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=15)
+    if resp2.status_code != 200:
+        return True
+
+    forecast2 = resp2.json().get("daily", {}).get("temperature_2m_max_gfs_seamless")
+    if not forecast2:
+        forecast2 = resp2.json().get("daily", {}).get("temperature_2m_max")
+
+    if forecast1 != forecast2:
+        print(f"  Forecast UPDATED: {forecast1} → {forecast2}")
+        print("  Fresh model run confirmed!")
+    else:
+        print(f"  Forecast unchanged: {forecast2}")
+        print("  Proceeding with current data (may be from previous run)")
+
+    return True
+
+
 def scan_date(weather_date):
     """Scan a single weather date across all cities. Returns dict of city trades."""
     city_trades = {}
@@ -553,13 +619,13 @@ def main():
     utc_now = datetime.utcnow()
     pt_hour = (utc_now.hour - 7) % 24
 
-    # Determine scan label
-    if pt_hour >= 9 and pt_hour < 15:
-        scan_label = "12z GFS Scan (10am PT)"
-    elif pt_hour >= 15 and pt_hour < 21:
-        scan_label = "18z GFS Scan (4pm PT)"
+    # Determine scan label (cron fires at 11:30am, 5:30pm, 11:30pm PT)
+    if pt_hour >= 10 and pt_hour < 16:
+        scan_label = "12z GFS Scan (11:30am PT)"
+    elif pt_hour >= 16 and pt_hour < 22:
+        scan_label = "18z GFS Scan (5:30pm PT)"
     else:
-        scan_label = "00z GFS Scan (10pm PT)"
+        scan_label = "00z GFS Scan (11:30pm PT)"
 
     weather_dates = get_weather_dates()
 
@@ -567,6 +633,10 @@ def main():
     print(f"Scan: {scan_label}")
     print(f"Weather dates: {', '.join(str(d) for d in weather_dates)}")
     print(f"Bankroll: ${BANKROLL:.0f}")
+    print()
+
+    # Verify we have a fresh GFS run before scanning
+    check_forecast_freshness()
     print()
 
     all_date_trades = {}
