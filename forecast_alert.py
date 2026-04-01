@@ -66,23 +66,13 @@ CALIBRATION = {
 
 
 def get_weather_dates():
-    """Get weather dates to scan based on time of day.
-
-    11:30am PT / 5:30pm PT: scan both today and tomorrow
-    11:30pm PT: scan tomorrow only
+    """Get tomorrow's weather date. Same-day trades disabled pending
+    separate sigma calibration for same-day forecasts.
     """
     utc_now = datetime.utcnow()
     pt_now = utc_now - timedelta(hours=7)  # PDT
-    today = pt_now.date()
-    tomorrow = today + timedelta(days=1)
-    pt_hour = pt_now.hour
-
-    if pt_hour >= 9 and pt_hour < 21:
-        # 11:30am or 5:30pm scan: both today and tomorrow
-        return [today, tomorrow]
-    else:
-        # 11:30pm scan: tomorrow only
-        return [tomorrow]
+    tomorrow = pt_now.date() + timedelta(days=1)
+    return [tomorrow]
 
 
 def fetch_forecast(city_key, weather_date):
