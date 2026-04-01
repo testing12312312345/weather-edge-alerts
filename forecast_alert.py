@@ -500,56 +500,63 @@ def expected_gfs_run():
         return "00z"
 
 
-def check_forecast_freshness():
+def check_forecast_freshness(max_retries=3):
     """Check if Open-Meteo has ingested the latest GFS run.
 
-    Compares the current gfs_seamless forecast against gfs_global.
-    If gfs_global has different values than 6 hours ago, the new run landed.
-    Uses a simple retry approach: fetch, wait, fetch again, compare.
+    Compares the current gfs_global forecast against the previous run (6h ago).
+    If they differ, the new model run has landed. If identical, retries up to
+    max_retries times (waiting 5 min between) before proceeding anyway.
     """
     expected = expected_gfs_run()
     print(f"  Expected GFS run: {expected}")
 
-    # Fetch initial forecast for a reference city (PHX)
-    params = {
+    current_params = {
         "latitude": 33.4373,
         "longitude": -112.0078,
         "daily": "temperature_2m_max",
         "temperature_unit": "fahrenheit",
         "timezone": "America/Phoenix",
         "forecast_days": 3,
-        "models": "gfs_seamless",
+        "models": "gfs_global",
     }
-    resp1 = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=15)
-    if resp1.status_code != 200:
-        print("  Could not check freshness, proceeding anyway")
-        return True
+    previous_params = {
+        **current_params,
+        "previous_runs_hours": 6,
+    }
 
-    forecast1 = resp1.json().get("daily", {}).get("temperature_2m_max_gfs_seamless")
-    if not forecast1:
-        # Try generic key
-        forecast1 = resp1.json().get("daily", {}).get("temperature_2m_max")
-    print(f"  Current GFS forecast (PHX): {forecast1}")
+    for attempt in range(max_retries):
+        try:
+            resp_cur = requests.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params=current_params, timeout=15,
+            )
+            resp_prev = requests.get(
+                "https://previous-runs-api.open-meteo.com/v1/forecast",
+                params=previous_params, timeout=15,
+            )
+        except Exception as e:
+            print(f"  Freshness check failed: {e}, proceeding anyway")
+            return True
 
-    # Wait 5 minutes and check again — if values change, fresh run just landed
-    print("  Waiting 5 minutes to verify forecast freshness...")
-    time.sleep(300)
+        if resp_cur.status_code != 200 or resp_prev.status_code != 200:
+            print("  Could not check freshness, proceeding anyway")
+            return True
 
-    resp2 = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=15)
-    if resp2.status_code != 200:
-        return True
+        current = resp_cur.json().get("daily", {}).get("temperature_2m_max", [])
+        previous = resp_prev.json().get("daily", {}).get("temperature_2m_max", [])
 
-    forecast2 = resp2.json().get("daily", {}).get("temperature_2m_max_gfs_seamless")
-    if not forecast2:
-        forecast2 = resp2.json().get("daily", {}).get("temperature_2m_max")
+        print(f"  Current run:  {current}")
+        print(f"  Previous run: {previous}")
 
-    if forecast1 != forecast2:
-        print(f"  Forecast UPDATED: {forecast1} → {forecast2}")
-        print("  Fresh model run confirmed!")
-    else:
-        print(f"  Forecast unchanged: {forecast2}")
-        print("  Proceeding with current data (may be from previous run)")
+        if current and previous and current != previous:
+            print("  Fresh GFS run confirmed!")
+            return True
 
+        if attempt < max_retries - 1:
+            print(f"  Forecast unchanged — waiting 5 min before retry ({attempt + 1}/{max_retries})...")
+            time.sleep(300)
+
+    print("  Forecast still unchanged after retries — proceeding with current data")
     return True
 
 
