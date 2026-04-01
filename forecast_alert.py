@@ -68,8 +68,8 @@ CALIBRATION = {
 def get_weather_dates():
     """Get weather dates to scan based on time of day.
 
-    10am PT / 4pm PT: scan both today and tomorrow
-    10pm PT: scan tomorrow only
+    11:30am PT / 5:30pm PT: scan both today and tomorrow
+    11:30pm PT: scan tomorrow only
     """
     utc_now = datetime.utcnow()
     pt_now = utc_now - timedelta(hours=7)  # PDT
@@ -78,10 +78,10 @@ def get_weather_dates():
     pt_hour = pt_now.hour
 
     if pt_hour >= 9 and pt_hour < 21:
-        # 10am or 4pm scan: both today and tomorrow
+        # 11:30am or 5:30pm scan: both today and tomorrow
         return [today, tomorrow]
     else:
-        # 10pm scan: tomorrow only
+        # 11:30pm scan: tomorrow only
         return [tomorrow]
 
 
