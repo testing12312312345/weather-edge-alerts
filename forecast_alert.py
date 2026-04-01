@@ -64,12 +64,24 @@ CALIBRATION = {
 }
 
 
-def get_tomorrow_date():
-    """Get tomorrow's weather date using Pacific time."""
+def get_weather_dates():
+    """Get weather dates to scan based on time of day.
+
+    10am PT / 4pm PT: scan both today and tomorrow
+    10pm PT: scan tomorrow only
+    """
     utc_now = datetime.utcnow()
     pt_now = utc_now - timedelta(hours=7)  # PDT
-    tomorrow = pt_now.date() + timedelta(days=1)
-    return tomorrow
+    today = pt_now.date()
+    tomorrow = today + timedelta(days=1)
+    pt_hour = pt_now.hour
+
+    if pt_hour >= 9 and pt_hour < 21:
+        # 10am or 4pm scan: both today and tomorrow
+        return [today, tomorrow]
+    else:
+        # 10pm scan: tomorrow only
+        return [tomorrow]
 
 
 def fetch_forecast(city_key, weather_date):
@@ -374,12 +386,10 @@ def find_tail_trades(bucket_prices, winning_label, bankroll, event_ticker, url_b
     return tails
 
 
-def format_discord(all_trades, weather_date, bankroll, scan_label):
-    """Format Discord alert message."""
-    day_name = weather_date.strftime("%A, %B %d")
-
+def format_discord(all_date_trades, bankroll, scan_label):
+    """Format Discord alert message for multiple weather dates."""
     lines = [
-        f"# Weather Edge Alert — {day_name}",
+        f"# Weather Edge Alert",
         f"**{scan_label}** | Bankroll: ${bankroll:.0f}",
         "",
     ]
@@ -387,53 +397,60 @@ def format_discord(all_trades, weather_date, bankroll, scan_label):
     total_cost = 0
     has_trades = False
 
-    for city_key, data in all_trades.items():
-        city_name = CITIES[city_key]["name"]
-        yes_trades = data.get("yes", [])
-        tail_trades = data.get("tails", [])
-        forecast = data.get("forecast", {})
+    for weather_date, city_trades in all_date_trades.items():
+        day_name = weather_date.strftime("%A, %B %d")
+        is_today = weather_date == (datetime.utcnow() - timedelta(hours=7)).date()
+        date_label = f"{day_name} ({'today' if is_today else 'tomorrow'})"
+        lines.append(f"## {date_label}")
+        lines.append("")
 
-        if not yes_trades and not tail_trades:
-            lines.append(f"## {city_name}")
-            lines.append("No edge found")
-            lines.append("")
-            continue
+        for city_key, data in city_trades.items():
+            city_name = CITIES[city_key]["name"]
+            yes_trades = data.get("yes", [])
+            tail_trades = data.get("tails", [])
+            forecast = data.get("forecast", {})
 
-        fc_str = ", ".join(f"{k}={v:.1f}F" for k, v in forecast.items())
-        lines.append(f"## {city_name} (forecast: {fc_str})")
+            if not yes_trades and not tail_trades:
+                lines.append(f"### {city_name}")
+                lines.append("No edge found")
+                lines.append("")
+                continue
 
-        for t in yes_trades:
-            has_trades = True
-            lines.append(
-                f"**BUY YES** {t['label']} — edge {t['edge']:.0%}"
-            )
-            lines.append(
-                f"   Buy {t['contracts']} contracts @ {t['entry_price']:.0f}c = **${t['cost']:.2f}**"
-            )
-            lines.append(
-                f"   Limit sell @ **{t['fair_value']:.0f}c** (model fair value)"
-            )
-            lines.append(
-                f"   Model: {t['model_prob']:.0%} | Market: {t['market_prob']:.0%}"
-            )
-            lines.append(f"   {t['url']}")
-            lines.append("")
-            total_cost += t["cost"]
+            fc_str = ", ".join(f"{k}={v:.1f}F" for k, v in forecast.items())
+            lines.append(f"### {city_name} (forecast: {fc_str})")
 
-        for t in tail_trades:
-            has_trades = True
-            lines.append(
-                f"**SELL NO** {t['label']} (priced at {t['yes_price']:.0f}c)"
-            )
-            lines.append(
-                f"   Buy {t['contracts']} NO @ ${t['cost']:.2f}"
-            )
-            lines.append(f"   {t['url']}")
-            lines.append("")
-            total_cost += t["cost"]
+            for t in yes_trades:
+                has_trades = True
+                lines.append(
+                    f"**BUY YES** {t['label']} — edge {t['edge']:.0%}"
+                )
+                lines.append(
+                    f"   Buy {t['contracts']} contracts @ {t['entry_price']:.0f}c = **${t['cost']:.2f}**"
+                )
+                lines.append(
+                    f"   Limit sell @ **{t['fair_value']:.0f}c** (model fair value)"
+                )
+                lines.append(
+                    f"   Model: {t['model_prob']:.0%} | Market: {t['market_prob']:.0%}"
+                )
+                lines.append(f"   {t['url']}")
+                lines.append("")
+                total_cost += t["cost"]
+
+            for t in tail_trades:
+                has_trades = True
+                lines.append(
+                    f"**SELL NO** {t['label']} (priced at {t['yes_price']:.0f}c)"
+                )
+                lines.append(
+                    f"   Buy {t['contracts']} NO @ ${t['cost']:.2f}"
+                )
+                lines.append(f"   {t['url']}")
+                lines.append("")
+                total_cost += t["cost"]
 
     if not has_trades:
-        lines.append("**No trades tonight** — no buckets underpriced >3%")
+        lines.append("**No trades** — no buckets underpriced >3%")
 
     lines.append("---")
     lines.append(f"Total cost: **${total_cost:.2f}**")
@@ -470,6 +487,68 @@ def send_discord(message):
     print("Discord alert sent!")
 
 
+def scan_date(weather_date):
+    """Scan a single weather date across all cities. Returns dict of city trades."""
+    city_trades = {}
+
+    for city_key, city_info in CITIES.items():
+        print(f"  Processing {city_info['name']} for {weather_date}...")
+
+        # Fetch forecast
+        forecast = fetch_forecast_multimodel(city_key, weather_date)
+        if not forecast:
+            print(f"    No forecast available")
+            city_trades[city_key] = {"yes": [], "tails": [], "forecast": {}}
+            continue
+
+        print(f"    Forecast: {forecast}")
+
+        # Find event
+        event = find_tomorrow_event(city_info["series"], weather_date)
+        if not event:
+            print(f"    No event found for {weather_date}")
+            city_trades[city_key] = {"yes": [], "tails": [], "forecast": forecast}
+            continue
+
+        event_ticker = event["event_ticker"]
+        print(f"    Event: {event_ticker}")
+
+        # Get markets and prices
+        resp = requests.get(
+            f"{KALSHI_API}/markets",
+            params={"event_ticker": event_ticker, "limit": 20},
+            timeout=15,
+        )
+        markets = resp.json().get("markets", [])
+        print(f"    Markets: {len(markets)}")
+
+        if not markets:
+            city_trades[city_key] = {"yes": [], "tails": [], "forecast": forecast}
+            continue
+
+        bucket_prices = get_orderbook_prices(markets)
+        bucket_str = ", ".join(f"{l}={info['mid']:.0f}c" for l, info in sorted(bucket_prices.items(), key=lambda x: x[1]["mid"], reverse=True))
+        print(f"    Buckets: {bucket_str}")
+
+        # Compute model probabilities
+        model_probs = compute_model_probs(forecast, city_key, bucket_prices)
+        if model_probs:
+            prob_str = ", ".join(f"{l}={p:.0%}" for l, p in sorted(model_probs.items(), key=lambda x: x[1], reverse=True))
+            print(f"    Model:   {prob_str}")
+
+        # Find YES trades
+        yes_trades = find_trades(bucket_prices, model_probs, BANKROLL, event_ticker, city_info["url_base"])
+        for t in yes_trades:
+            print(f"    TRADE: BUY {t['label']} @{t['entry_price']:.0f}c, limit sell @{t['fair_value']:.0f}c, edge={t['edge']:.0%}, {t['contracts']}c=${t['cost']:.2f}")
+
+        # Find tail NO trades
+        tail_trades = find_tail_trades(bucket_prices, None, BANKROLL, event_ticker, city_info["url_base"])
+
+        city_trades[city_key] = {"yes": yes_trades, "tails": tail_trades, "forecast": forecast}
+
+    return city_trades
+
+
 def main():
     utc_now = datetime.utcnow()
     pt_hour = (utc_now.hour - 7) % 24
@@ -482,72 +561,21 @@ def main():
     else:
         scan_label = "00z GFS Scan (10pm PT)"
 
-    weather_date = get_tomorrow_date()
+    weather_dates = get_weather_dates()
 
     print(f"Weather Edge Alert v2 — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Scan: {scan_label}")
-    print(f"Weather date: {weather_date}")
+    print(f"Weather dates: {', '.join(str(d) for d in weather_dates)}")
     print(f"Bankroll: ${BANKROLL:.0f}")
     print()
 
-    all_trades = {}
-
-    for city_key, city_info in CITIES.items():
-        print(f"Processing {city_info['name']}...")
-
-        # Fetch forecast
-        forecast = fetch_forecast_multimodel(city_key, weather_date)
-        if not forecast:
-            print(f"  No forecast available")
-            all_trades[city_key] = {"yes": [], "tails": [], "forecast": {}}
-            continue
-
-        print(f"  Forecast: {forecast}")
-
-        # Find event
-        event = find_tomorrow_event(city_info["series"], weather_date)
-        if not event:
-            print(f"  No event found for {weather_date}")
-            all_trades[city_key] = {"yes": [], "tails": [], "forecast": forecast}
-            continue
-
-        event_ticker = event["event_ticker"]
-        print(f"  Event: {event_ticker}")
-
-        # Get markets and prices
-        resp = requests.get(
-            f"{KALSHI_API}/markets",
-            params={"event_ticker": event_ticker, "limit": 20},
-            timeout=15,
-        )
-        markets = resp.json().get("markets", [])
-        print(f"  Markets: {len(markets)}")
-
-        if not markets:
-            all_trades[city_key] = {"yes": [], "tails": [], "forecast": forecast}
-            continue
-
-        bucket_prices = get_orderbook_prices(markets)
-        bucket_str = ", ".join(f"{l}={info['mid']:.0f}c" for l, info in sorted(bucket_prices.items(), key=lambda x: x[1]["mid"], reverse=True))
-        print(f"  Buckets: {bucket_str}")
-
-        # Compute model probabilities
-        model_probs = compute_model_probs(forecast, city_key, bucket_prices)
-        if model_probs:
-            print(f"  Model:   {', '.join(f'{l}={p:.0%}' for l, p in sorted(model_probs.items(), key=lambda x: x[1], reverse=True))}")
-
-        # Find YES trades
-        yes_trades = find_trades(bucket_prices, model_probs, BANKROLL, event_ticker, city_info["url_base"])
-        for t in yes_trades:
-            print(f"  TRADE: BUY {t['label']} @{t['entry_price']:.0f}c, limit sell @{t['fair_value']:.0f}c, edge={t['edge']:.0%}, {t['contracts']}c=${t['cost']:.2f}")
-
-        # Find tail NO trades
-        tail_trades = find_tail_trades(bucket_prices, None, BANKROLL, event_ticker, city_info["url_base"])
-
-        all_trades[city_key] = {"yes": yes_trades, "tails": tail_trades, "forecast": forecast}
+    all_date_trades = {}
+    for weather_date in weather_dates:
+        print(f"--- Scanning {weather_date} ---")
+        all_date_trades[weather_date] = scan_date(weather_date)
 
     # Format and send
-    message = format_discord(all_trades, weather_date, BANKROLL, scan_label)
+    message = format_discord(all_date_trades, BANKROLL, scan_label)
     send_discord(message)
 
 
