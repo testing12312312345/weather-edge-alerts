@@ -59,9 +59,9 @@ CITIES = {
 # Pre-computed calibration from 300+ days of backtest data
 # Updated periodically as more data accumulates
 CALIBRATION = {
-    "PHX": {"gfs_bias": -1.4, "nbm_bias": -1.3, "sigma": 1.8},
-    "LAX": {"gfs_bias": -0.3, "sigma": 1.8},
-    "LV":  {"gfs_bias": -0.4, "nbm_bias": 0.1, "sigma": 1.1},
+    "PHX": {"gfs_bias": -1.7, "nbm_bias": -1.5, "sigma": 1.5},
+    "LAX": {"gfs_bias": -0.3, "sigma": 1.5},
+    "LV":  {"gfs_bias": -0.5, "nbm_bias": 0.0, "sigma": 1.0},
 }
 
 
