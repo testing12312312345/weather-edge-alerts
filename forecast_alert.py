@@ -507,82 +507,36 @@ def check_noaa_gfs_available(run_date, run_hour):
 
 
 def check_forecast_freshness(max_retries=6):
-    """Verify the expected GFS run has been published by NOAA and ingested
-    by Open-Meteo before recommending trades.
+    """Verify the expected GFS run has been published by NOAA before
+    recommending trades.
 
-    Step 1: Check NOAA for the expected GFS run (instant, authoritative).
-    Step 2: Fetch Open-Meteo forecast, store it, wait, fetch again.
-            If it changed, Open-Meteo ingested the new run.
+    Our cron fires 6.5h after GFS model init. NOAA typically publishes
+    ~5h after init, and Open-Meteo ingests within ~30-60 min of NOAA.
+    So by the time we run, Open-Meteo has had the data for ~1 hour.
 
-    Retries up to max_retries (5 min apart). Returns False if unable
-    to confirm fresh data — caller should skip the scan.
+    The NOAA check is the authoritative gate: if the run directory exists,
+    the data is available and Open-Meteo will have ingested it by now.
+
+    Retries up to max_retries (5 min apart). Returns False if the
+    expected run hasn't been published — caller should skip the scan.
     """
     run_date, run_hour = expected_gfs_run()
     print(f"  Expected GFS run: {run_hour}z on {run_date}")
 
-    # Step 1: Is the run published on NOAA?
     for attempt in range(max_retries):
         noaa_ready = check_noaa_gfs_available(run_date, run_hour)
         print(f"  NOAA {run_hour}z: {'AVAILABLE' if noaa_ready else 'NOT YET'}")
 
-        if not noaa_ready:
-            if attempt < max_retries - 1:
-                print(f"  Waiting 5 min for NOAA ({attempt + 1}/{max_retries})...")
-                time.sleep(300)
-                continue
-            print("  WARNING: GFS run not published on NOAA — skipping scan")
-            return False
-        break
+        if noaa_ready:
+            print("  GFS run confirmed on NOAA — proceeding")
+            return True
 
-    # Step 2: Has Open-Meteo ingested it? Fetch, wait, fetch, compare.
-    om_params = {
-        "latitude": 33.4373,
-        "longitude": -112.0078,
-        "daily": "temperature_2m_max",
-        "temperature_unit": "fahrenheit",
-        "timezone": "America/Phoenix",
-        "forecast_days": 3,
-        "models": "gfs_seamless",
-    }
+        if attempt < max_retries - 1:
+            print(f"  Waiting 5 min ({attempt + 1}/{max_retries})...")
+            time.sleep(300)
 
-    def fetch_om():
-        try:
-            resp = requests.get("https://api.open-meteo.com/v1/forecast",
-                                params=om_params, timeout=15)
-            if resp.status_code != 200:
-                return None
-            data = resp.json().get("daily", {})
-            return data.get("temperature_2m_max") or data.get("temperature_2m_max_gfs_seamless")
-        except Exception:
-            return None
-
-    first_fetch = fetch_om()
-    print(f"  Open-Meteo forecast: {first_fetch}")
-
-    if first_fetch is None:
-        print("  WARNING: Could not fetch Open-Meteo — skipping scan")
-        return False
-
-    # Wait 3 min, then check if Open-Meteo updated
-    print("  Waiting 3 min to verify Open-Meteo ingestion...")
-    time.sleep(180)
-
-    second_fetch = fetch_om()
-    print(f"  Open-Meteo after wait: {second_fetch}")
-
-    if second_fetch is None:
-        print("  WARNING: Could not re-fetch Open-Meteo — skipping scan")
-        return False
-
-    if first_fetch != second_fetch:
-        print("  Open-Meteo just updated — fresh data confirmed!")
-        return True
-
-    # Values unchanged — Open-Meteo may have already ingested the run earlier
-    # (our cron fires 6h+ after model init, so this is the expected case)
-    # Since NOAA confirmed the run exists, proceed.
-    print("  Open-Meteo unchanged (likely already ingested) — NOAA confirms run exists, proceeding")
-    return True
+    print("  WARNING: GFS run not published on NOAA after 30 min — skipping scan")
+    return False
 
 
 def scan_date(weather_date):
