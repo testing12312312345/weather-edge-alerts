@@ -490,12 +490,15 @@ def expected_gfs_run():
         return "00z"
 
 
-def check_forecast_freshness(max_retries=3):
+def check_forecast_freshness(max_retries=6):
     """Check if Open-Meteo has ingested the latest GFS run.
 
-    Compares the current gfs_global forecast against the previous run (6h ago).
+    Compares the current gfs_seamless forecast against the previous run (6h ago).
     If they differ, the new model run has landed. If identical, retries up to
-    max_retries times (waiting 5 min between) before proceeding anyway.
+    max_retries times (waiting 5 min between). If still unchanged after all
+    retries, sends a warning to Discord and does NOT proceed with stale data.
+
+    Returns True if fresh data confirmed, False if stale.
     """
     expected = expected_gfs_run()
     print(f"  Expected GFS run: {expected}")
@@ -507,7 +510,7 @@ def check_forecast_freshness(max_retries=3):
         "temperature_unit": "fahrenheit",
         "timezone": "America/Phoenix",
         "forecast_days": 3,
-        "models": "gfs_global",
+        "models": "gfs_seamless",
     }
     previous_params = {
         **current_params,
@@ -525,15 +528,27 @@ def check_forecast_freshness(max_retries=3):
                 params=previous_params, timeout=15,
             )
         except Exception as e:
-            print(f"  Freshness check failed: {e}, proceeding anyway")
-            return True
+            print(f"  Freshness check failed: {e}")
+            if attempt < max_retries - 1:
+                print(f"  Retrying in 5 min ({attempt + 1}/{max_retries})...")
+                time.sleep(300)
+                continue
+            return False
 
         if resp_cur.status_code != 200 or resp_prev.status_code != 200:
-            print("  Could not check freshness, proceeding anyway")
-            return True
+            print(f"  API error (cur={resp_cur.status_code}, prev={resp_prev.status_code})")
+            if attempt < max_retries - 1:
+                print(f"  Retrying in 5 min ({attempt + 1}/{max_retries})...")
+                time.sleep(300)
+                continue
+            return False
 
         current = resp_cur.json().get("daily", {}).get("temperature_2m_max", [])
+        if not current:
+            current = resp_cur.json().get("daily", {}).get("temperature_2m_max_gfs_seamless", [])
         previous = resp_prev.json().get("daily", {}).get("temperature_2m_max", [])
+        if not previous:
+            previous = resp_prev.json().get("daily", {}).get("temperature_2m_max_gfs_seamless", [])
 
         print(f"  Current run:  {current}")
         print(f"  Previous run: {previous}")
@@ -546,8 +561,8 @@ def check_forecast_freshness(max_retries=3):
             print(f"  Forecast unchanged — waiting 5 min before retry ({attempt + 1}/{max_retries})...")
             time.sleep(300)
 
-    print("  Forecast still unchanged after retries — proceeding with current data")
-    return True
+    print("  WARNING: Forecast unchanged after all retries — skipping this scan")
+    return False
 
 
 def scan_date(weather_date):
@@ -633,8 +648,20 @@ def main():
     print()
 
     # Verify we have a fresh GFS run before scanning
-    check_forecast_freshness()
+    is_fresh = check_forecast_freshness()
     print()
+
+    if not is_fresh:
+        stale_msg = (
+            f"# Weather Edge Alert — SKIPPED\n"
+            f"**{scan_label}** | Bankroll: ${BANKROLL:.0f}\n\n"
+            f"Could not confirm fresh GFS run after 30 min of retries. "
+            f"Skipping this scan to avoid trading on stale data.\n"
+            f"Next scan will retry."
+        )
+        send_discord(stale_msg)
+        print("Scan skipped — stale forecast data")
+        return
 
     all_date_trades = {}
     for weather_date in weather_dates:
