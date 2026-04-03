@@ -22,6 +22,7 @@ from scipy import stats
 import numpy as np
 
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
+APPS_SCRIPT_URL = os.environ.get("APPS_SCRIPT_URL", "")
 BANKROLL = float(os.environ.get("BANKROLL", "200"))
 KALSHI_API = "https://api.elections.kalshi.com/trade-api/v2"
 SPREAD = 2.0  # cents
@@ -60,33 +61,171 @@ CITIES = {
         "lat": 25.7906,
         "lon": -80.3164,
         "tz": "America/New_York",
-        "blend": {"gfs": 1},
+        "blend": {"gfs": 1, "nbm": 1},
         "url_base": "https://kalshi.com/markets/kxhighmia/miami-high-temperature-daily",
+    },
+    "CHI": {
+        "series": "KXHIGHCHI",
+        "name": "Chicago",
+        "lat": 41.78417,
+        "lon": -87.75528,
+        "tz": "America/Chicago",
+        "blend": {"gfs": 1},
+        "url_base": "https://kalshi.com/markets/kxhighchi/highest-temperature-in-chicago",
     },
 }
 
-# Pre-computed calibration from 300+ days of backtest data
-# Updated periodically as more data accumulates
-CALIBRATION = {
+# Fallback calibration — used only if live calibration API calls fail
+CALIBRATION_FALLBACK = {
     "PHX": {"gfs_bias": -1.7, "nbm_bias": -1.5, "sigma": 1.5},
     "LAX": {"gfs_bias": -0.3, "sigma": 1.5},
     "LV":  {"gfs_bias": -0.5, "nbm_bias": 0.0, "sigma": 1.0},
-    "MIA": {"gfs_bias": -1.4, "sigma": 1.1},
+    "MIA": {"gfs_bias": -1.4, "nbm_bias": -1.5, "sigma": 1.3},
+    "CHI": {"gfs_bias": 1.1, "sigma": 1.4},
 }
+
+# Cache for live calibration (computed once per run)
+_calibration_cache = {}
+
+
+def compute_live_calibration(city_key, cal_days=60):
+    """Walk-forward calibration: pull last N days of forecast-vs-actual
+    from Open-Meteo and compute bias + per-model sigma on the fly.
+
+    Returns dict like {"gfs_bias": ..., "nbm_bias": ..., "sigma": ...}
+    Falls back to static values if API calls fail.
+    """
+    if city_key in _calibration_cache:
+        return _calibration_cache[city_key]
+
+    city = CITIES[city_key]
+    blend = city["blend"]
+    lat, lon, tz = city["lat"], city["lon"], city["tz"]
+
+    end_date = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+    start_date = (datetime.utcnow() - timedelta(days=cal_days + 1)).strftime("%Y-%m-%d")
+
+    try:
+        # 1. Actual observed highs
+        resp_actual = requests.get(
+            "https://archive-api.open-meteo.com/v1/archive",
+            params={
+                "latitude": lat, "longitude": lon,
+                "daily": "temperature_2m_max",
+                "temperature_unit": "fahrenheit",
+                "timezone": tz,
+                "start_date": start_date, "end_date": end_date,
+            }, timeout=15,
+        )
+        if resp_actual.status_code != 200:
+            raise ValueError(f"Archive API {resp_actual.status_code}")
+
+        actual_data = resp_actual.json()["daily"]
+        actual_map = {}
+        for d, t in zip(actual_data["time"], actual_data["temperature_2m_max"]):
+            if t is not None:
+                actual_map[d] = t
+
+        # 2. Historical forecasts (what models predicted)
+        models_param = "gfs_seamless"
+        if "nbm" in blend:
+            models_param = "gfs_seamless,ncep_nbm_conus"
+
+        resp_fc = requests.get(
+            "https://historical-forecast-api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": lat, "longitude": lon,
+                "daily": "temperature_2m_max",
+                "temperature_unit": "fahrenheit",
+                "timezone": tz,
+                "start_date": start_date, "end_date": end_date,
+                "models": models_param,
+            }, timeout=15,
+        )
+        if resp_fc.status_code != 200:
+            raise ValueError(f"Historical Forecast API {resp_fc.status_code}")
+
+        fc_data = resp_fc.json()["daily"]
+        fc_dates = fc_data["time"]
+        gfs_key = next((k for k in fc_data if "gfs" in k and k != "time"), None)
+        nbm_key = next((k for k in fc_data if "nbm" in k and k != "time"), None)
+        # Single-model requests return generic key instead of model-specific
+        if gfs_key is None and "temperature_2m_max" in fc_data and "nbm" not in models_param:
+            gfs_key = "temperature_2m_max"
+
+        # 3. Compute errors per model
+        result = {}
+        sigmas = {}
+        calibrated_models = set()
+        for model_name, fc_key in [("gfs", gfs_key), ("nbm", nbm_key)]:
+            if fc_key is None or model_name not in blend:
+                continue
+            errors = []
+            for i, d in enumerate(fc_dates):
+                if i >= len(fc_data[fc_key]):
+                    break
+                fc_val = fc_data[fc_key][i]
+                if fc_val is not None and d in actual_map:
+                    errors.append(fc_val - actual_map[d])
+
+            if len(errors) >= 10:
+                result[f"{model_name}_bias"] = float(np.mean(errors))
+                sigmas[model_name] = float(np.std(errors, ddof=1))
+                calibrated_models.add(model_name)
+                print(f"    Live cal {city_key} {model_name}: bias={result[f'{model_name}_bias']:+.2f}, "
+                      f"sigma={sigmas[model_name]:.2f}, n={len(errors)}")
+            else:
+                print(f"    Live cal {city_key} {model_name}: insufficient data ({len(errors)} points), excluding from blend")
+
+        if not sigmas:
+            raise ValueError("No model had enough data")
+
+        # Store which models were successfully calibrated
+        result["_calibrated_models"] = calibrated_models
+
+        # 4. Blended sigma (weighted by blend weights, same as backtest)
+        total_w = 0
+        weighted_var = 0
+        for model_name, w in blend.items():
+            if model_name in sigmas:
+                weighted_var += w * sigmas[model_name] ** 2
+                total_w += w
+        blended_sigma = max(np.sqrt(weighted_var / total_w), 0.5) if total_w > 0 else 1.5
+        result["sigma"] = float(blended_sigma)
+        print(f"    Live cal {city_key} blended sigma: {blended_sigma:.2f}")
+
+        _calibration_cache[city_key] = result
+        return result
+
+    except Exception as e:
+        print(f"    Live calibration failed for {city_key}: {e}")
+        print(f"    Using fallback static calibration")
+        fallback = CALIBRATION_FALLBACK[city_key]
+        _calibration_cache[city_key] = fallback
+        return fallback
+
+
+def _pt_now():
+    """Get current Pacific time, handling DST correctly."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/Los_Angeles"))
+    except ImportError:
+        # Fallback for Python < 3.9 — use PDT (UTC-7)
+        return datetime.utcnow() - timedelta(hours=7)
 
 
 def get_weather_dates():
     """Get tomorrow's weather date. Same-day trades disabled pending
     separate sigma calibration for same-day forecasts.
     """
-    utc_now = datetime.utcnow()
-    pt_now = utc_now - timedelta(hours=7)  # PDT
+    pt_now = _pt_now()
     tomorrow = pt_now.date() + timedelta(days=1)
     return [tomorrow]
 
 
 def fetch_forecast(city_key, weather_date):
-    """Fetch GFS/NBM forecast from Open-Meteo."""
+    """Fetch GFS forecast from Open-Meteo (explicit model, not default blend)."""
     city = CITIES[city_key]
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
@@ -96,6 +235,7 @@ def fetch_forecast(city_key, weather_date):
         "temperature_unit": "fahrenheit",
         "timezone": city["tz"],
         "forecast_days": 3,
+        "models": "gfs_seamless",
     }
 
     resp = requests.get(url, params=params, timeout=15)
@@ -106,11 +246,13 @@ def fetch_forecast(city_key, weather_date):
     data = resp.json()
     daily = data.get("daily", {})
     dates = daily.get("time", [])
-    temps = daily.get("temperature_2m_max", [])
+    # With explicit model, key may be model-specific or generic
+    temps = daily.get("temperature_2m_max_gfs_seamless",
+                      daily.get("temperature_2m_max", []))
 
     target = weather_date.strftime("%Y-%m-%d")
     for i, d in enumerate(dates):
-        if d == target and temps[i] is not None:
+        if d == target and i < len(temps) and temps[i] is not None:
             return {"gfs": temps[i]}
 
     return None
@@ -150,14 +292,17 @@ def fetch_forecast_multimodel(city_key, weather_date):
     for key in daily:
         if key == "time":
             continue
+        vals = daily[key]
         for i, d in enumerate(dates):
-            if d == target and daily[key][i] is not None:
+            if i >= len(vals):
+                break
+            if d == target and vals[i] is not None:
                 if "gfs" in key:
-                    result["gfs"] = daily[key][i]
+                    result["gfs"] = vals[i]
                 elif "nbm" in key:
-                    result["nbm"] = daily[key][i]
+                    result["nbm"] = vals[i]
                 elif "temperature" in key and "gfs" not in result:
-                    result["gfs"] = daily[key][i]
+                    result["gfs"] = vals[i]
 
     return result if result else None
 
@@ -261,21 +406,24 @@ def get_orderbook_prices(markets):
 def compute_model_probs(forecast, city_key, bucket_prices):
     """Compute calibrated probabilities for each bucket."""
     city = CITIES[city_key]
-    cal = CALIBRATION[city_key]
+    cal = compute_live_calibration(city_key)
     blend = city["blend"]
+    calibrated = cal.get("_calibrated_models", set(blend.keys()))
 
-    # Bias-correct and blend
-    corrected = []
-    for model in blend:
-        if model in forecast:
+    # Bias-correct and blend (weighted, matching backtest formula)
+    weighted_sum = 0
+    total_weight = 0
+    for model, weight in blend.items():
+        if model in forecast and model in calibrated:
             bias_key = f"{model}_bias"
             bias = cal.get(bias_key, 0)
-            corrected.append(forecast[model] - bias)
+            weighted_sum += weight * (forecast[model] - bias)
+            total_weight += weight
 
-    if not corrected:
+    if total_weight == 0:
         return {}
 
-    blended_temp = np.mean(corrected)
+    blended_temp = weighted_sum / total_weight
     sigma = cal["sigma"]
 
     # Compute probability for each bucket
@@ -303,7 +451,7 @@ def find_trades(bucket_prices, model_probs, bankroll, event_ticker, url_base):
         return []
 
     total_price = sum(info["mid"] for info in bucket_prices.values())
-    if total_price < 30:
+    if total_price < 50:
         return []
 
     trades = []
@@ -355,8 +503,8 @@ def find_trades(bucket_prices, model_probs, bankroll, event_ticker, url_base):
     # Sort by edge (best first)
     trades.sort(key=lambda t: t["edge"], reverse=True)
 
-    # Return top 2 (don't overload)
-    return trades[:2]
+    # Return top 1 (matches validated backtest — single best edge per city)
+    return trades[:1]
 
 
 def find_tail_trades(bucket_prices, winning_label, bankroll, event_ticker, url_base):
@@ -400,7 +548,7 @@ def format_discord(all_date_trades, bankroll, scan_label):
 
     for weather_date, city_trades in all_date_trades.items():
         day_name = weather_date.strftime("%A, %B %d")
-        is_today = weather_date == (datetime.utcnow() - timedelta(hours=7)).date()
+        is_today = weather_date == _pt_now().date()
         date_label = f"{day_name} ({'today' if is_today else 'tomorrow'})"
         lines.append(f"## {date_label}")
         lines.append("")
@@ -554,6 +702,7 @@ def scan_date(weather_date):
     city_trades = {}
 
     for city_key, city_info in CITIES.items():
+      try:
         print(f"  Processing {city_info['name']} for {weather_date}...")
 
         # Fetch forecast
@@ -581,6 +730,10 @@ def scan_date(weather_date):
             params={"event_ticker": event_ticker, "limit": 20},
             timeout=15,
         )
+        if resp.status_code != 200:
+            print(f"    Kalshi markets API error: {resp.status_code}")
+            city_trades[city_key] = {"yes": [], "tails": [], "forecast": forecast}
+            continue
         markets = resp.json().get("markets", [])
         print(f"    Markets: {len(markets)}")
 
@@ -603,17 +756,110 @@ def scan_date(weather_date):
         for t in yes_trades:
             print(f"    TRADE: BUY {t['label']} @{t['entry_price']:.0f}c, limit sell @{t['fair_value']:.0f}c, edge={t['edge']:.0%}, {t['contracts']}c=${t['cost']:.2f}")
 
-        # Find tail NO trades
-        tail_trades = find_tail_trades(bucket_prices, None, BANKROLL, event_ticker, city_info["url_base"])
+        # Attach calibration metadata to trades for logging
+        cal = compute_live_calibration(city_key)
+        blend = city_info["blend"]
+        calibrated = cal.get("_calibrated_models", set(blend.keys()))
+        weighted_sum = 0
+        total_weight = 0
+        for model, weight in blend.items():
+            if model in forecast and model in calibrated:
+                bias = cal.get(f"{model}_bias", 0)
+                weighted_sum += weight * (forecast[model] - bias)
+                total_weight += weight
+        corrected_temp = weighted_sum / total_weight if total_weight > 0 else None
 
-        city_trades[city_key] = {"yes": yes_trades, "tails": tail_trades, "forecast": forecast}
+        for t in yes_trades:
+            t["_gfs_raw"] = forecast.get("gfs")
+            t["_nbm_raw"] = forecast.get("nbm")
+            t["_corrected"] = corrected_temp
+            t["_sigma"] = cal.get("sigma")
+            t["_gfs_bias"] = cal.get("gfs_bias")
+
+        city_trades[city_key] = {"yes": yes_trades, "tails": [], "forecast": forecast}
+
+      except Exception as e:
+        print(f"    ERROR processing {city_info['name']}: {e}")
+        city_trades[city_key] = {"yes": [], "tails": [], "forecast": {}}
 
     return city_trades
 
 
+def log_trades_to_sheets(all_date_trades, scan_label):
+    """Log recommended trades to Google Sheets for live tracking."""
+    if not APPS_SCRIPT_URL:
+        print("No APPS_SCRIPT_URL set, skipping sheets logging")
+        return
+
+    alert_time = datetime.utcnow().isoformat() + "Z"
+
+    # Determine scan time label
+    if "11:30am" in scan_label:
+        scan = "11:30am"
+    elif "5:30pm" in scan_label:
+        scan = "5:30pm"
+    else:
+        scan = "11:30pm"
+
+    HEADERS = [
+        "Alert Time", "Scan", "City", "Weather Date", "Bucket",
+        "Contracts", "Entry (c)", "Limit Sell (c)", "Edge (%)",
+        "Model Prob (%)", "GFS Raw (°F)", "NBM Raw (°F)",
+        "Corrected (°F)", "Sigma (°F)", "GFS Bias",
+        "Placed?", "Limit Filled?", "Settlement Bucket",
+    ]
+
+    rows = []
+    for weather_date, city_trades in all_date_trades.items():
+        for city_key, data in city_trades.items():
+            for t in data.get("yes", []):
+                rows.append([
+                    alert_time,
+                    scan,
+                    city_key,
+                    weather_date.isoformat(),
+                    t["label"],
+                    t["contracts"],
+                    round(t["entry_price"], 1),
+                    round(t["fair_value"], 1),
+                    round(t["edge"] * 100, 1),
+                    round(t["model_prob"] * 100, 1),
+                    round(t.get("_gfs_raw", 0), 1) if t.get("_gfs_raw") else "",
+                    round(t.get("_nbm_raw", 0), 1) if t.get("_nbm_raw") else "",
+                    round(t.get("_corrected", 0), 1) if t.get("_corrected") else "",
+                    round(t.get("_sigma", 0), 2) if t.get("_sigma") else "",
+                    round(t.get("_gfs_bias", 0), 2) if t.get("_gfs_bias") is not None else "",
+                    "",  # Placed? (manual)
+                    "",  # Limit Filled? (manual)
+                    "",  # Settlement Bucket (manual)
+                ])
+
+    if not rows:
+        print("No trades to log")
+        return
+
+    try:
+        resp = requests.post(
+            APPS_SCRIPT_URL,
+            json={
+                "action": "flush",
+                "batches": [{"sheet": "Trade Log", "headers": HEADERS, "rows": rows}],
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        if result.get("ok"):
+            print(f"Logged {len(rows)} trades to Google Sheets")
+        else:
+            print(f"Sheets logging error: {result.get('error')}")
+    except Exception as e:
+        print(f"Sheets logging failed: {e}")
+
+
 def main():
     utc_now = datetime.utcnow()
-    pt_hour = (utc_now.hour - 7) % 24
+    pt_hour = _pt_now().hour
 
     # Determine scan label (cron fires at 11:30am, 5:30pm, 11:30pm PT)
     if pt_hour >= 10 and pt_hour < 16:
@@ -655,6 +901,9 @@ def main():
     # Format and send
     message = format_discord(all_date_trades, BANKROLL, scan_label)
     send_discord(message)
+
+    # Log trades to Google Sheets for tracking
+    log_trades_to_sheets(all_date_trades, scan_label)
 
 
 if __name__ == "__main__":
