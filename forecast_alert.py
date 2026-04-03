@@ -54,6 +54,15 @@ CITIES = {
         "blend": {"gfs": 1, "nbm": 1},
         "url_base": "https://kalshi.com/markets/kxhightlv/las-vegas-high-temperature-daily",
     },
+    "MIA": {
+        "series": "KXHIGHMIA",
+        "name": "Miami",
+        "lat": 25.7906,
+        "lon": -80.3164,
+        "tz": "America/New_York",
+        "blend": {"gfs": 1},
+        "url_base": "https://kalshi.com/markets/kxhighmia/miami-high-temperature-daily",
+    },
 }
 
 # Pre-computed calibration from 300+ days of backtest data
@@ -62,6 +71,7 @@ CALIBRATION = {
     "PHX": {"gfs_bias": -1.7, "nbm_bias": -1.5, "sigma": 1.5},
     "LAX": {"gfs_bias": -0.3, "sigma": 1.5},
     "LV":  {"gfs_bias": -0.5, "nbm_bias": 0.0, "sigma": 1.0},
+    "MIA": {"gfs_bias": -1.4, "sigma": 1.1},
 }
 
 
