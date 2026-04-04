@@ -35,6 +35,7 @@ CITIES = {
         "lon": -112.0078,
         "tz": "America/Phoenix",
         "blend": {"gfs": 1, "nbm": 1},
+        "cli_station": "CLIPHX",
         "url_base": "https://kalshi.com/markets/kxhightphx/phoenix-high-temperature-daily",
     },
     "LAX": {
@@ -44,6 +45,7 @@ CITIES = {
         "lon": -118.3889,
         "tz": "America/Los_Angeles",
         "blend": {"gfs": 1, "nbm": 1},
+        "cli_station": "CLILAX",
         "url_base": "https://kalshi.com/markets/kxhighlax/highest-temperature-in-los-angeles",
     },
     "LV": {
@@ -53,6 +55,7 @@ CITIES = {
         "lon": -115.1522,
         "tz": "America/Los_Angeles",
         "blend": {"gfs": 1, "nbm": 1},
+        "cli_station": "CLIVGT",
         "url_base": "https://kalshi.com/markets/kxhightlv/las-vegas-high-temperature-daily",
     },
     "MIA": {
@@ -62,6 +65,7 @@ CITIES = {
         "lon": -80.3164,
         "tz": "America/New_York",
         "blend": {"gfs": 1, "nbm": 1},
+        "cli_station": "CLIMIA",
         "url_base": "https://kalshi.com/markets/kxhighmia/miami-high-temperature-daily",
     },
     "CHI": {
@@ -71,6 +75,7 @@ CITIES = {
         "lon": -87.75528,
         "tz": "America/Chicago",
         "blend": {"gfs": 1},
+        "cli_station": "CLIMDW",
         "url_base": "https://kalshi.com/markets/kxhighchi/highest-temperature-in-chicago",
     },
 }
@@ -88,12 +93,51 @@ CALIBRATION_FALLBACK = {
 _calibration_cache = {}
 
 
-def compute_live_calibration(city_key, cal_days=60):
-    """Walk-forward calibration: pull last N days of forecast-vs-actual
-    from Open-Meteo and compute bias + per-model sigma on the fly.
+def _fetch_cli_actuals(cli_station, cal_days=60):
+    """Fetch actual high temps from NWS CLI reports via IEM archive.
+    These are the official settlement values Kalshi uses.
+    """
+    actual_map = {}
+    for days_ago in range(0, cal_days + 2):
+        d = datetime.utcnow() - timedelta(days=days_ago)
+        date_str = d.strftime("%Y-%m-%d")
+        try:
+            resp = requests.get(
+                "https://mesonet.agron.iastate.edu/cgi-bin/afos/retrieve.py",
+                params={"pil": cli_station,
+                        "sdate": f"{date_str}T00:00",
+                        "edate": f"{date_str}T23:59"},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                continue
+            m = re.search(r'MAXIMUM\s+(\d+)', resp.text)
+            if not m:
+                continue
+            high = int(m.group(1))
+            # Determine weather date: "TODAY" = same day, else = day before
+            temp_section = ""
+            if 'TEMPERATURE' in resp.text and 'MAXIMUM' in resp.text:
+                ti = resp.text.index('TEMPERATURE')
+                mi = resp.text.index('MAXIMUM')
+                if mi > ti:
+                    temp_section = resp.text[ti:mi]
+            if 'TODAY' in temp_section:
+                weather_date = d.strftime("%Y-%m-%d")
+            else:
+                weather_date = (d - timedelta(days=1)).strftime("%Y-%m-%d")
+            actual_map[weather_date] = float(high)
+        except Exception:
+            continue
+    return actual_map
 
-    Returns dict like {"gfs_bias": ..., "nbm_bias": ..., "sigma": ...}
-    Falls back to static values if API calls fail.
+
+def compute_live_calibration(city_key, cal_days=60):
+    """Walk-forward calibration using NWS CLI settlement actuals.
+
+    Pulls actual high temps from IEM's CLI archive (the same data
+    Kalshi settles against), then computes forecast bias and sigma.
+    Falls back to Open-Meteo archive if CLI fetch fails.
     """
     if city_key in _calibration_cache:
         return _calibration_cache[city_key]
@@ -101,30 +145,40 @@ def compute_live_calibration(city_key, cal_days=60):
     city = CITIES[city_key]
     blend = city["blend"]
     lat, lon, tz = city["lat"], city["lon"], city["tz"]
+    cli_station = city.get("cli_station", "")
 
     end_date = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
     start_date = (datetime.utcnow() - timedelta(days=cal_days + 1)).strftime("%Y-%m-%d")
 
     try:
-        # 1. Actual observed highs
-        resp_actual = requests.get(
-            "https://archive-api.open-meteo.com/v1/archive",
-            params={
-                "latitude": lat, "longitude": lon,
-                "daily": "temperature_2m_max",
-                "temperature_unit": "fahrenheit",
-                "timezone": tz,
-                "start_date": start_date, "end_date": end_date,
-            }, timeout=15,
-        )
-        if resp_actual.status_code != 200:
-            raise ValueError(f"Archive API {resp_actual.status_code}")
-
-        actual_data = resp_actual.json()["daily"]
+        # 1. Actual observed highs — prefer CLI (settlement source)
         actual_map = {}
-        for d, t in zip(actual_data["time"], actual_data["temperature_2m_max"]):
-            if t is not None:
-                actual_map[d] = t
+        if cli_station:
+            actual_map = _fetch_cli_actuals(cli_station, cal_days)
+            if len(actual_map) >= 20:
+                print(f"    Using CLI actuals for {city_key}: {len(actual_map)} days")
+            else:
+                print(f"    CLI actuals insufficient ({len(actual_map)} days), falling back to Open-Meteo")
+                actual_map = {}
+
+        if not actual_map:
+            resp_actual = requests.get(
+                "https://archive-api.open-meteo.com/v1/archive",
+                params={
+                    "latitude": lat, "longitude": lon,
+                    "daily": "temperature_2m_max",
+                    "temperature_unit": "fahrenheit",
+                    "timezone": tz,
+                    "start_date": start_date, "end_date": end_date,
+                }, timeout=15,
+            )
+            if resp_actual.status_code != 200:
+                raise ValueError(f"Archive API {resp_actual.status_code}")
+            actual_data = resp_actual.json()["daily"]
+            for d, t in zip(actual_data["time"], actual_data["temperature_2m_max"]):
+                if t is not None:
+                    actual_map[d] = t
+            print(f"    Using Open-Meteo actuals for {city_key}: {len(actual_map)} days")
 
         # 2. Historical forecasts (what models predicted)
         models_param = "gfs_seamless"
