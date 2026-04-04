@@ -43,7 +43,7 @@ CITIES = {
         "lat": 33.9381,
         "lon": -118.3889,
         "tz": "America/Los_Angeles",
-        "blend": {"gfs": 1},
+        "blend": {"gfs": 1, "nbm": 1},
         "url_base": "https://kalshi.com/markets/kxhighlax/highest-temperature-in-los-angeles",
     },
     "LV": {
