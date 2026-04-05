@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import time
+import xml.etree.ElementTree as ET
 from datetime import datetime, date, timedelta
 
 import requests
@@ -36,6 +37,7 @@ CITIES = {
         "tz": "America/Phoenix",
         "blend": {"gfs": 1, "nbm": 1},
         "cli_station": "CLIPHX",
+        "obs_station": "KPHX",
         "url_base": "https://kalshi.com/markets/kxhightphx/phoenix-high-temperature-daily",
     },
     "LAX": {
@@ -46,6 +48,7 @@ CITIES = {
         "tz": "America/Los_Angeles",
         "blend": {"gfs": 1, "nbm": 1},
         "cli_station": "CLILAX",
+        "obs_station": "KLAX",
         "url_base": "https://kalshi.com/markets/kxhighlax/highest-temperature-in-los-angeles",
     },
     "LV": {
@@ -56,6 +59,7 @@ CITIES = {
         "tz": "America/Los_Angeles",
         "blend": {"gfs": 1, "nbm": 1},
         "cli_station": "CLIVGT",
+        "obs_station": "KVGT",
         "url_base": "https://kalshi.com/markets/kxhightlv/las-vegas-high-temperature-daily",
     },
     "MIA": {
@@ -66,6 +70,7 @@ CITIES = {
         "tz": "America/New_York",
         "blend": {"gfs": 1, "nbm": 1},
         "cli_station": "CLIMIA",
+        "obs_station": "KMIA",
         "url_base": "https://kalshi.com/markets/kxhighmia/miami-high-temperature-daily",
     },
     "CHI": {
@@ -76,6 +81,7 @@ CITIES = {
         "tz": "America/Chicago",
         "blend": {"gfs": 1},
         "cli_station": "CLIMDW",
+        "obs_station": "KMDW",
         "url_base": "https://kalshi.com/markets/kxhighchi/highest-temperature-in-chicago",
     },
 }
@@ -269,6 +275,31 @@ def _pt_now():
         return datetime.utcnow() - timedelta(hours=7)
 
 
+def fetch_current_obs(city_key):
+    """Fetch latest observed temperature from NWS METAR station.
+    Returns temperature in Fahrenheit, or None on failure.
+    """
+    city = CITIES[city_key]
+    station_id = city.get("obs_station")
+    if not station_id:
+        return None
+    try:
+        resp = requests.get(
+            f"https://api.weather.gov/stations/{station_id}/observations/latest",
+            headers={"User-Agent": "weather-edge-alerts/1.0"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return None
+        props = resp.json().get("properties", {})
+        temp_c = props.get("temperature", {}).get("value")
+        if temp_c is None:
+            return None
+        return round(temp_c * 9 / 5 + 32, 1)
+    except Exception:
+        return None
+
+
 def get_weather_dates():
     """Get tomorrow's weather date. Same-day trades disabled pending
     separate sigma calibration for same-day forecasts.
@@ -359,6 +390,51 @@ def fetch_forecast_multimodel(city_key, weather_date):
                     result["gfs"] = vals[i]
 
     return result if result else None
+
+
+def fetch_nws_ndfd_forecast(city_key, weather_date):
+    """Fetch NWS NDFD point forecast (max temperature) for a city/date.
+
+    Uses the DWML XML endpoint. Returns the forecast high temp in F,
+    or None if the request fails or data is unavailable.
+    Non-blocking: any failure returns None silently.
+    """
+    city = CITIES[city_key]
+    target = weather_date.strftime("%Y-%m-%d")
+    begin = f"{target}T06:00:00"
+    end = f"{target}T23:59:59"
+
+    try:
+        resp = requests.get(
+            "https://graphical.weather.gov/xml/sample_products/browser_interface/ndfdXMLclient.php",
+            params={
+                "lat": city["lat"],
+                "lon": city["lon"],
+                "product": "time-series",
+                "maxt": "maxt",
+                "begin": begin,
+                "end": end,
+            },
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            print(f"    NWS NDFD error for {city_key}: HTTP {resp.status_code}")
+            return None
+
+        root = ET.fromstring(resp.text)
+        # DWML namespace varies; search for temperature elements with type="maximum"
+        for temp_elem in root.iter("temperature"):
+            if temp_elem.get("type") == "maximum":
+                for val_elem in temp_elem.iter("value"):
+                    if val_elem.text:
+                        nws_temp = float(val_elem.text)
+                        print(f"    NWS NDFD forecast for {city_key}: {nws_temp:.0f}F")
+                        return nws_temp
+        print(f"    NWS NDFD: no max temp found for {city_key} on {target}")
+        return None
+    except Exception as e:
+        print(f"    NWS NDFD fetch failed for {city_key}: {e}")
+        return None
 
 
 def find_tomorrow_event(series_ticker, weather_date):
@@ -464,6 +540,13 @@ def compute_model_probs(forecast, city_key, bucket_prices):
     blend = city["blend"]
     calibrated = cal.get("_calibrated_models", set(blend.keys()))
 
+    # Cross-model disagreement gate: skip if GFS and NBM disagree by >4°F
+    if "gfs" in forecast and "nbm" in forecast and "gfs" in blend and "nbm" in blend:
+        model_spread = abs(forecast["gfs"] - forecast["nbm"])
+        if model_spread > 4.0:
+            print(f"    SKIP: GFS/NBM disagree by {model_spread:.1f}°F (>{4.0}°F threshold) for {city_key}")
+            return {}
+
     # Bias-correct and blend (weighted, matching backtest formula)
     weighted_sum = 0
     total_weight = 0
@@ -506,6 +589,12 @@ def find_trades(bucket_prices, model_probs, bankroll, event_ticker, url_base):
 
     total_price = sum(info["mid"] for info in bucket_prices.values())
     if total_price < 50:
+        return []
+
+    # Thin market gate: need at least 5 buckets with non-zero prices
+    nonzero_buckets = sum(1 for info in bucket_prices.values() if info["mid"] > 0)
+    if nonzero_buckets < 5:
+        print(f"    SKIP: Only {nonzero_buckets} buckets with non-zero prices (need >=5, too thin)")
         return []
 
     trades = []
@@ -807,6 +896,26 @@ def scan_date(weather_date):
 
         # Find YES trades
         yes_trades = find_trades(bucket_prices, model_probs, BANKROLL, event_ticker, city_info["url_base"])
+
+        # METAR safety check: skip trades where current obs already exceeds bucket
+        current_obs = fetch_current_obs(city_key)
+        if current_obs is not None:
+            print(f"    Current obs: {current_obs:.1f}°F")
+        filtered_trades = []
+        for t in yes_trades:
+            t["_current_obs"] = current_obs
+            if current_obs is not None:
+                bucket_info = bucket_prices.get(t["label"], {})
+                bucket_range = bucket_info.get("range")
+                if bucket_range:
+                    _, bucket_hi = bucket_range
+                    # If current temp already exceeds bucket upper bound, skip
+                    if bucket_hi < 900 and current_obs > bucket_hi:
+                        print(f"    SKIP: Current obs {current_obs:.1f}°F already exceeds {t['label']} upper bound ({bucket_hi:.0f}°F)")
+                        continue
+            filtered_trades.append(t)
+        yes_trades = filtered_trades
+
         for t in yes_trades:
             print(f"    TRADE: BUY {t['label']} @{t['entry_price']:.0f}c, limit sell @{t['fair_value']:.0f}c, edge={t['edge']:.0%}, {t['contracts']}c=${t['cost']:.2f}")
 
@@ -823,12 +932,16 @@ def scan_date(weather_date):
                 total_weight += weight
         corrected_temp = weighted_sum / total_weight if total_weight > 0 else None
 
+        # Fetch NWS NDFD point forecast (non-blocking)
+        nws_forecast = fetch_nws_ndfd_forecast(city_key, weather_date)
+
         for t in yes_trades:
             t["_gfs_raw"] = forecast.get("gfs")
             t["_nbm_raw"] = forecast.get("nbm")
             t["_corrected"] = corrected_temp
             t["_sigma"] = cal.get("sigma")
             t["_gfs_bias"] = cal.get("gfs_bias")
+            t["_nws_forecast"] = nws_forecast
 
         city_trades[city_key] = {"yes": yes_trades, "tails": [], "forecast": forecast}
 
@@ -860,6 +973,7 @@ def log_trades_to_sheets(all_date_trades, scan_label):
         "Contracts", "Entry (c)", "Limit Sell (c)", "Edge (%)",
         "Model Prob (%)", "GFS Raw (°F)", "NBM Raw (°F)",
         "Corrected (°F)", "Sigma (°F)", "GFS Bias",
+        "NWS Forecast (°F)",
         "Placed?", "Limit Filled?", "Settlement Bucket",
     ]
 
@@ -883,6 +997,7 @@ def log_trades_to_sheets(all_date_trades, scan_label):
                     round(t.get("_corrected", 0), 1) if t.get("_corrected") else "",
                     round(t.get("_sigma", 0), 2) if t.get("_sigma") else "",
                     round(t.get("_gfs_bias", 0), 2) if t.get("_gfs_bias") is not None else "",
+                    round(t.get("_nws_forecast", 0), 1) if t.get("_nws_forecast") is not None else "",
                     "",  # Placed? (manual)
                     "",  # Limit Filled? (manual)
                     "",  # Settlement Bucket (manual)
