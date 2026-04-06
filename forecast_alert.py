@@ -35,7 +35,7 @@ CITIES = {
         "lat": 33.4373,
         "lon": -112.0078,
         "tz": "America/Phoenix",
-        "blend": {"gfs": 1, "nbm": 1},
+        "blend": {"gfs": 1},
         "cli_station": "CLIPHX",
         "obs_station": "KPHX",
         "url_base": "https://kalshi.com/markets/kxhightphx/phoenix-high-temperature-daily",
@@ -46,7 +46,7 @@ CITIES = {
         "lat": 33.9381,
         "lon": -118.3889,
         "tz": "America/Los_Angeles",
-        "blend": {"gfs": 1, "nbm": 1},
+        "blend": {"gfs": 1},
         "cli_station": "CLILAX",
         "obs_station": "KLAX",
         "url_base": "https://kalshi.com/markets/kxhighlax/highest-temperature-in-los-angeles",
@@ -54,24 +54,13 @@ CITIES = {
     "LV": {
         "series": "KXHIGHTLV",
         "name": "Las Vegas",
-        "lat": 36.0800,
-        "lon": -115.1522,
+        "lat": 36.21205,
+        "lon": -115.19395,
         "tz": "America/Los_Angeles",
-        "blend": {"gfs": 1, "nbm": 1},
+        "blend": {"gfs": 1},
         "cli_station": "CLIVGT",
         "obs_station": "KVGT",
         "url_base": "https://kalshi.com/markets/kxhightlv/las-vegas-high-temperature-daily",
-    },
-    "MIA": {
-        "series": "KXHIGHMIA",
-        "name": "Miami",
-        "lat": 25.7906,
-        "lon": -80.3164,
-        "tz": "America/New_York",
-        "blend": {"gfs": 1, "nbm": 1},
-        "cli_station": "CLIMIA",
-        "obs_station": "KMIA",
-        "url_base": "https://kalshi.com/markets/kxhighmia/miami-high-temperature-daily",
     },
     "CHI": {
         "series": "KXHIGHCHI",
@@ -88,11 +77,10 @@ CITIES = {
 
 # Fallback calibration — used only if live calibration API calls fail
 CALIBRATION_FALLBACK = {
-    "PHX": {"gfs_bias": -1.7, "nbm_bias": -1.5, "sigma": 1.5},
-    "LAX": {"gfs_bias": -0.3, "sigma": 1.5},
-    "LV":  {"gfs_bias": -0.5, "nbm_bias": 0.0, "sigma": 1.0},
-    "MIA": {"gfs_bias": -1.4, "nbm_bias": -1.5, "sigma": 1.3},
-    "CHI": {"gfs_bias": 1.1, "sigma": 1.4},
+    "PHX": {"gfs_bias": -1.4, "sigma": 1.0},
+    "LAX": {"gfs_bias": -0.2, "sigma": 1.3},
+    "LV":  {"gfs_bias": 0.0, "sigma": 0.6},
+    "CHI": {"gfs_bias": -0.3, "sigma": 1.3},
 }
 
 # Cache for live calibration (computed once per run)
@@ -897,14 +885,16 @@ def scan_date(weather_date):
         # Find YES trades
         yes_trades = find_trades(bucket_prices, model_probs, BANKROLL, event_ticker, city_info["url_base"])
 
-        # METAR safety check: skip trades where current obs already exceeds bucket
+        # METAR safety check: only for same-day bets (current obs constrains today's max)
+        # For next-day bets, today's temp tells us nothing about tomorrow's high
         current_obs = fetch_current_obs(city_key)
         if current_obs is not None:
             print(f"    Current obs: {current_obs:.1f}°F")
+        is_same_day = weather_date == _pt_now().date()
         filtered_trades = []
         for t in yes_trades:
             t["_current_obs"] = current_obs
-            if current_obs is not None:
+            if is_same_day and current_obs is not None:
                 bucket_info = bucket_prices.get(t["label"], {})
                 bucket_range = bucket_info.get("range")
                 if bucket_range:
