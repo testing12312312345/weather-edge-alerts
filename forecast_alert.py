@@ -602,7 +602,7 @@ def find_trades(bucket_prices, model_probs, bankroll, event_ticker, url_base):
     # Find all underpriced buckets (edge > 3%)
     for label, info in bucket_prices.items():
         mid = info["mid"]
-        if mid < 5 or mid > 60:
+        if mid < 2 or mid > 60:
             continue
 
         market_prob = mid / total_price
@@ -643,11 +643,20 @@ def find_trades(bucket_prices, model_probs, bankroll, event_ticker, url_base):
             "url": f"{url_base}/{event_ticker.lower()}",
         })
 
-    # Sort by edge (best first)
-    trades.sort(key=lambda t: t["edge"], reverse=True)
+    if not trades:
+        return []
 
-    # Return top 1 (matches validated backtest — single best edge per city)
-    return trades[:1]
+    # Return two picks: best edge and best probability (if different)
+    best_edge = max(trades, key=lambda t: t["edge"])
+    best_edge["_pick"] = "BEST EDGE"
+    best_prob = max(trades, key=lambda t: t["model_prob"])
+    best_prob["_pick"] = "BEST PROB"
+
+    if best_edge["label"] == best_prob["label"]:
+        best_edge["_pick"] = "BEST EDGE + PROB"
+        return [best_edge]
+    else:
+        return [best_edge, best_prob]
 
 
 def find_tail_trades(bucket_prices, winning_label, bankroll, event_ticker, url_base):
@@ -713,8 +722,9 @@ def format_discord(all_date_trades, bankroll, scan_label):
 
             for t in yes_trades:
                 has_trades = True
+                pick = t.get("_pick", "")
                 lines.append(
-                    f"**BUY YES** {t['label']} — edge {t['edge']:.0%}"
+                    f"**BUY YES** {t['label']} — edge {t['edge']:.0%} [{pick}]"
                 )
                 lines.append(
                     f"   Buy {t['contracts']} contracts @ {t['entry_price']:.0f}c = **${t['cost']:.2f}**"
