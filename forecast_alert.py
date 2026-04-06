@@ -62,6 +62,17 @@ CITIES = {
         "obs_station": "KVGT",
         "url_base": "https://kalshi.com/markets/kxhightlv/las-vegas-high-temperature-daily",
     },
+    "MIA": {
+        "series": "KXHIGHMIA",
+        "name": "Miami",
+        "lat": 25.7906,
+        "lon": -80.3164,
+        "tz": "America/New_York",
+        "blend": {"gfs": 1},
+        "cli_station": "CLIMIA",
+        "obs_station": "KMIA",
+        "url_base": "https://kalshi.com/markets/kxhighmia/miami-high-temperature-daily",
+    },
     "CHI": {
         "series": "KXHIGHCHI",
         "name": "Chicago",
@@ -80,6 +91,7 @@ CALIBRATION_FALLBACK = {
     "PHX": {"gfs_bias": -1.4, "sigma": 1.0},
     "LAX": {"gfs_bias": -0.2, "sigma": 1.3},
     "LV":  {"gfs_bias": 0.0, "sigma": 0.6},
+    "MIA": {"gfs_bias": -1.3, "sigma": 1.0},
     "CHI": {"gfs_bias": -0.3, "sigma": 1.3},
 }
 
